@@ -46,6 +46,44 @@ def test_compute_features_golden():
     assert good["house_match"] == 1.0
 
 
+def test_cross_script_roman_features_fire():
+    """A Devanagari candidate has no ASCII name overlap; only romanization can match."""
+    s1 = _record("S1-1", "Sharma Textiles", "12 Gandhi Road, Pune, Maharashtra", "India")
+    cand = _record("S2-1", "शर्मा टेक्सटाइल्स", "12 Gandhi Road, Pune, Maharashtra", "India")
+    pairs = pd.DataFrame(
+        {
+            "s1_id": ["S1-1"],
+            "cand_id": ["S2-1"],
+            "is_s2": [True],
+            "pass_id": [1],
+            "block_score": [1.0],
+        }
+    )
+    cfg = type("C", (), {"seed": 42, "cap": 200, "dataset_dir": None})()
+    row = compute_features(pairs, s1, cand, cfg).iloc[0]
+    assert row["name_exact"] == 0.0
+    assert row["script_match"] == 0.0
+    # Transliteration aligns imperfectly (measured mean fuzz ~67 across schemes, never an
+    # exact hit), so the roman features are graded signals rather than equality tests.
+    assert row["roman_exact"] == 0.0
+    assert row["roman_ratio"] > 0.6
+    # Casefolding the ITRANS output ("sharmA" -> "sharma") lets the shared name token
+    # "sharma" actually match; without it this pair shares no token at all.
+    assert row["roman_jaccard"] > 0.0
+    assert row["roman_common_prefix"] >= 0.5
+    # The identical ASCII address is the reliable bridge for this pair.
+    assert row["addr_ratio"] > 0.9
+    assert row["house_match"] == 1.0
+
+
+def test_feature_order_includes_script_bridge_columns():
+    from ber.features import EXTRA_FEATURES, feature_columns
+
+    cols = feature_columns()
+    for name in EXTRA_FEATURES:
+        assert name in cols
+
+
 def test_attach_country_maps_all_sources(tmp_path):
     from ber.features import _COUNTRY_CACHE, attach_country
 

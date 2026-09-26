@@ -26,6 +26,8 @@ DATA/reports/
 DATA/tmp/
 DATA/pairs/
 DATA/features/
+# Embedding shards: 9.6 GB of fp16 vectors for train, regenerable via tools/run_embed.py
+DATA/emb/
 
 # Submission build output
 dist/

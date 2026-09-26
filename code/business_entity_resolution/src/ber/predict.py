@@ -9,13 +9,28 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from ber.db import connect
+
 
 def _load_booster(cfg):
     models = Path(cfg.models_dir)
     booster = lgb.Booster(model_file=str(models / "lgbm.txt"))
     features = json.loads((models / "feature_list.json").read_text(encoding="utf-8"))
-    threshold = float(json.loads((models / "threshold.json").read_text(encoding="utf-8"))["global"])
-    return booster, features, threshold
+    params = json.loads((models / "threshold.json").read_text(encoding="utf-8"))
+    return booster, features, params
+
+
+def _decision_floor(params):
+    """Lowest score worth persisting.
+
+    The margin and singleton-tau rules need each entity's top-2 candidate scores, so
+    predictions are written down to a floor below the accept threshold rather than
+    filtered at it. Anything at or above the floor can still matter to the decision.
+    """
+    threshold = float(params.get("global", params.get("threshold", 0.5)))
+    margin = float(params.get("margin", 0.0))
+    tau = float(params.get("singleton_tau", 0.0))
+    return max(0.0, min(threshold, tau) - margin - 1e-6)
 
 
 def _feature_sources(cfg, split):
@@ -29,7 +44,7 @@ def _feature_sources(cfg, split):
     raise FileNotFoundError(f"no feature parts or combined features for split={split}")
 
 
-def predict_parts(cfg, split, booster, features, threshold, out_dir=None):
+def predict_parts(cfg, split, booster, features, floor, out_dir=None):
     data = Path(cfg.data_dir)
     pred_dir = Path(out_dir) if out_dir is not None else data / "tmp" / f"{split}_pred"
     if pred_dir.exists():
@@ -45,7 +60,7 @@ def predict_parts(cfg, split, booster, features, threshold, out_dir=None):
         ):
             frame = batch.to_pandas()
             probs = booster.predict(frame[features], num_iteration=booster.best_iteration)
-            mask = probs >= threshold
+            mask = probs >= floor
             if mask.any():
                 out = pd.DataFrame(
                     {
@@ -62,7 +77,7 @@ def predict_parts(cfg, split, booster, features, threshold, out_dir=None):
         if writer is not None:
             writer.close()
         total += part_rows
-        print(f"[predict] part {i + 1}/{len(sources)}: {part_rows:,} matches", flush=True)
+        print(f"[predict] part {i + 1}/{len(sources)}: {part_rows:,} scored pairs kept", flush=True)
     return pred_dir, total
 
 
@@ -76,12 +91,7 @@ def _write_tsv(cfg, split, use_one_to_one, n_buckets=64):
     matching = out_dir / "matching_results.tsv"
     candidate = out_dir / "candidate_pairs.tsv"
 
-    con = duckdb.connect()
-    con.execute("SET memory_limit='8GB'")
-    con.execute("SET threads=8")
-    con.execute("SET preserve_insertion_order=false")
-    con.execute(f"SET temp_directory='{(data / 'tmp').as_posix()}'")
-    con.execute("PRAGMA max_temp_directory_size='60GiB'")
+    con = connect(cfg)
     con.execute(
         f"CREATE TEMP TABLE s1list AS SELECT entity_id AS source1_entity_id FROM read_parquet('{s1_parquet}')"
     )

@@ -17,10 +17,12 @@ class Config:
     neg_ratio: int = 4
     lgbm_params: dict = None
     pass_caps: dict = None
+    db: dict = None
 
     def __post_init__(self):
         object.__setattr__(self, "lgbm_params", self.lgbm_params or {})
         object.__setattr__(self, "pass_caps", self.pass_caps or {})
+        object.__setattr__(self, "db", self.db or {})
 
     @classmethod
     def load(cls, path):

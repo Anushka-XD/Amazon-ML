@@ -1,7 +1,68 @@
+## Why key-based blocking saturated, and what replaces it
+
+Measured on real missed truth pairs:
+
+- **61.6%** of missed pairs were produced by the blocking join and then discarded by a cap;
+  **0.0%** were signal-absent.
+- Recall saturates at **0.884** across per-S1 cap 200 -> 3200 (candidates/S1 flattens at ~235),
+  so the per-S1 cap is the binding constraint, not the key set.
+- **Romanization is not the answer**: across 6 schemes, mean fuzz 61-68, only **9.9%** of
+  cross-script pairs share a romanized token. The address is the real bridge (**97.5%** of
+  cross-script pairs share an address token).
+- **Dense retrieval is.** `intfloat/multilingual-e5-small` (384-dim, 118M, MIT): true
+  cross-script pairs mean cosine **0.929** (p10 0.890) against unrelated **0.822** (p90 0.850).
+  Of the pairs blocking *currently misses*, **100%** clear cosine 0.85 and 96.3% clear 0.90.
+
+So the residual recall gap is a **similarity-measure** gap, not absent signal — which is what
+makes >= 0.99 plausible in principle, and why embeddings rather than more key passes are the
+remaining lever.
+
 # Results
 
 Authoritative metric: macro F_0.5 (beta = 0.5), per Source 1 entity, singletons included.
 The only true score is produced by the challenge portal from `output/matching_results.tsv`.
+
+**Evaluation protocol (binding):** every macro F0.5 below is computed on the **complete
+held-out candidate set** for grouped-split Source 1 entities, using the exact inference-time
+decision rule. The 4:1 sampled training distribution is never used to report a score.
+
+## Status: no new F0.5 measured yet
+
+Work in progress targets **macro F0.5 >= 0.99 including France**. What has been measured this
+session is **blocking recall**, not F0.5:
+
+| Quantity | Value |
+|---|---|
+| Blocking recall, baseline (cap=200) | 0.8142 |
+| Blocking recall, cap=400 + `house_number` fix | 0.8714 |
+| Blocking recall, + address passes 11-14 | **0.8836** |
+| Oracle macro F0.5 at recall 0.8836 (perfect matcher) | ~0.975 |
+| **Last measured full-candidate macro F0.5** | **0.8488** |
+| Last official leaderboard score | 0.811 |
+| Target | 0.99 |
+
+Recall is a ceiling, not a score, and 0.8836 is **unvalidated** — no model has been retrained on
+the new candidate set, so it is unknown whether the larger candidate set raises F0.5 or dilutes
+precision. Macro F0.5 weights precision double, so this must be measured, not assumed.
+
+## Ceiling analysis (why 0.814 recall capped F0.5 at ~0.95)
+
+Inverting `1.25R/(0.25+R) = 0.99` gives R ~= 0.952 per entity **at perfect precision**. Because
+misses are entity-correlated rather than pair-independent, the pair recall actually needed for
+0.99 is ~0.97+. Two further terms are arithmetic, not tunable:
+
+- **Singletons**: 5.59% of Source 1 entities are singletons, worth 1.0 for predicting empty and
+  0.0 for a false merge. False-merging every one caps macro F0.5 at **0.944**.
+- **France** is 14.98% of test Source 1 and has no labels. Leave-one-country-out measured
+  0.668 (US->India, *and* a script change) and 0.804 (India->US, same script). France is
+  Latin-script like US, so **0.804 is the relevant proxy**; and both LOO runs achieved only
+  ~92% *of their own candidate-set ceiling* (0.869 / 0.732), so the LOO figure is itself
+  recall-limited and pessimistic.
+
+Decomposing the official 0.811 against the 0.8488 US+India held-out estimate implies France is
+currently scoring roughly **0.60** — worse than the LOO proxy, consistent with the address-key
+defects below. France is therefore the single largest identified source of lost score, not a
+15% rounding error.
 
 ## Official leaderboard result
 
@@ -19,8 +80,8 @@ The only true score is produced by the challenge portal from `output/matching_re
 | **Official leaderboard (public, Portal)** | **0.811** | real score, 26 Sep 2026 |
 | 4:1 sampled split (train, grouped) | 0.9807 | **optimistic, not leaderboard-comparable** |
 | **Full candidates, held-out S1 (test-like)** | **0.8488** | 95% CI 0.8481–0.8496; over-estimates by ~0.04 |
-| Unseen-country proxy (train US -> India) | 0.6684 | France proxy (lower bound) |
-| Unseen-country proxy (train India -> US) | 0.8041 | France proxy |
+| Unseen-country proxy (train US -> India) | 0.6684 | France proxy, **lower bound** — confounds a script change |
+| Unseen-country proxy (train India -> US) | 0.8041 | France proxy, **same script — the relevant estimate** |
 | Full model, US val entities | 0.8905 | in-domain |
 | Full model, India val entities | 0.7885 | in-domain |
 

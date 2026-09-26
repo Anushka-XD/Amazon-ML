@@ -17,7 +17,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="ber")
     parser.add_argument(
         "command",
-        choices=["prepare", "block", "audit", "features", "train", "tune", "predict", "outputs", "evaluate", "validation", "loo", "all"],
+        choices=["prepare", "block", "ann", "union", "recall", "audit", "features", "train",
+                 "tune", "predict", "outputs", "evaluate", "validation", "loo", "diagnose",
+                 "all"],
     )
     parser.add_argument("--config", default=_default_config())
     parser.add_argument("--split", default="both", choices=["train", "test", "both"])
@@ -27,6 +29,10 @@ def main(argv=None):
     parser.add_argument("--reuse-predictions", action="store_true", dest="reuse_predictions")
     parser.add_argument("--combine", action="store_true")
     parser.add_argument("--keep-merged", action="store_true", dest="keep_merged")
+    parser.add_argument("--topk", type=int, default=50, help="ANN neighbours per S1 entity")
+    parser.add_argument("--min-cos", type=float, default=0.80,
+                        help="drop retrieval candidates scoring below this cosine")
+    parser.add_argument("--emb-dir", default=None, help="override embedding shard directory")
     args = parser.parse_args(argv)
     cfg = Config.load(args.config)
 
@@ -89,6 +95,42 @@ def main(argv=None):
         from ber.validation import evaluate_loo
 
         print(evaluate_loo(cfg))
+    if args.command in ("ann",):
+        from ber.ann_retrieve import retrieve_ann
+
+        splits = ("train", "test") if args.split == "both" else (args.split,)
+        for split in splits:
+            print(retrieve_ann(cfg, split, topk=args.topk, min_cos=args.min_cos,
+                               emb_dir=args.emb_dir))
+    if args.command in ("union",):
+        from ber.union_candidates import union_candidates
+
+        splits = ("train", "test") if args.split == "both" else (args.split,)
+        for split in splits:
+            data = Path(cfg.data_dir)
+            print(union_candidates(
+                cfg,
+                data / "candidates" / f"{split}_candidates.parquet",
+                data / "candidates" / f"{split}_ann_candidates.parquet",
+                data / "candidates" / f"{split}_union_candidates.parquet",
+            ))
+    if args.command in ("recall",):
+        import json as _json
+
+        from ber.ann_retrieve import audit_recall
+
+        splits = ("train", "test") if args.split == "both" else (args.split,)
+        for split in splits:
+            print(_json.dumps(audit_recall(cfg, split), indent=2))
+    if args.command in ("diagnose",):
+        import json
+
+        from ber.diagnostic import classify_missing, oracle_macro
+
+        print(json.dumps(oracle_macro(cfg, args.split if args.split != "both" else "train"),
+                         indent=2, default=str))
+        print(json.dumps(classify_missing(cfg, args.split if args.split != "both" else "train"),
+                         indent=2, default=str))
     return 0
 
 

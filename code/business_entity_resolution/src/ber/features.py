@@ -1,14 +1,24 @@
+"""Feature enrichment + materialisation strategies.
+
+`strategy="block"`: one merged parquet per hash bucket of s1_id, all buckets on disk.
+`strategy="stream"`: one bucket in memory at a time, features written then bucket freed.
+
+The stream strategy exists because the merged block for the full test candidate set is
+tens of GB; on a 20 GB disk it cannot be materialised at all.
+"""
+
 import shutil
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-import duckdb
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
+
+from ber.db import connect
 
 S1_COLS = [
     "entity_id", "name_norm", "name_fold", "name_roman", "name_tokens", "name_stripped",
@@ -24,7 +34,22 @@ FEATURE_ORDER = [
     "street_jaccard", "postal_exact", "postal_prefix3", "state_match", "landmark",
     "addr_missing", "addr_len_diff", "same_country", "is_s2", "pass_id", "block_score",
     "s1_degree", "cand_degree",
+    # Script-bridge signals. Source 1 train names are 100% ASCII while ~15% of S2/S3
+    # names are Indic, so the romanized form is the only comparable surface for those
+    # pairs and the model needs it explicitly rather than inferring it.
+    "roman_exact", "roman_jaccard", "name_common_prefix", "roman_common_prefix",
+    "addr_house_digits",
+    # Dense retrieval similarity. Recovered pairs the key-based blocker misses
+    # entirely: measured mean cosine 0.965 on missed truth pairs versus 0.822 for
+    # unrelated pairs, and identical names score 1.000. -1.0 when the pair was not
+    # proposed by the retriever, so "not retrieved" is distinguishable from "retrieved
+    # and judged dissimilar".
+    "emb_cos", "emb_retrieved", "emb_agrees_with_block",
 ]
+
+# Cheap, high-signal string similarities that reward sub-token edits and reordered
+# tokens; the shipped model had no representation of these.
+_DISTANCE_ONLY = {"name_ratio", "name_jaro", "addr_ratio", "roman_ratio", "name_partial"}
 
 
 def load_frame(path, columns=S1_COLS):
@@ -72,6 +97,15 @@ def _pair_set_metrics(tokens1, tokens2):
         jaccard.append(len(inter) / len(union) if union else 0.0)
         containment.append(len(inter) / min(len(a), len(b)) if (a and b) else 0.0)
     return np.asarray(jaccard, dtype=np.float32), np.asarray(containment, dtype=np.float32)
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
 
 
 def _feature_block(merged):
@@ -153,7 +187,50 @@ def _feature_block(merged):
     out["block_score"] = merged["block_score"].astype(np.float32)
     out["s1_degree"] = merged["s1_degree"].astype(np.float32)
     out["cand_degree"] = merged["cand_degree"].astype(np.float32)
+
+    # Script-bridge signal: for an Indic candidate the romanized form is the only
+    # comparable surface, so make cross-script name agreement explicit.
+    out["roman_exact"] = np.asarray(s1_roman == c_roman, dtype=np.float32)
+    out["roman_jaccard"] = _pair_set_metrics(
+        [frozenset(s.split()) for s in s1_roman], [frozenset(s.split()) for s in c_roman]
+    )[0]
+    out["name_common_prefix"] = np.array(
+        [_common_prefix_len(a, b) / max(len(a), len(b), 1) for a, b in zip(s1_norm, c_norm)],
+        dtype=np.float32,
+    )
+    out["roman_common_prefix"] = np.array(
+        [_common_prefix_len(a, b) / max(len(a), len(b), 1) for a, b in zip(s1_roman, c_roman)],
+        dtype=np.float32,
+    )
+    out["addr_house_digits"] = np.array(
+        [1.0 if (a[:1].isdigit() and b[:1].isdigit()) else 0.0 for a, b in zip(s1_addr, c_addr)],
+        dtype=np.float32,
+    )
+
+    # Dense-retrieval columns. Absent columns mean the pair came only from key-based
+    # blocking, which is itself informative: `emb_agrees_with_block` is the agreement
+    # signal that distinguishes a pair two independent methods both endorse.
+    if "emb_cos" in merged.columns:
+        cos = pd.to_numeric(merged["emb_cos"], errors="coerce").fillna(-1.0)
+        out["emb_cos"] = cos.to_numpy(dtype=np.float32)
+        out["emb_retrieved"] = (cos.to_numpy() >= 0.0).astype(np.float32)
+    else:
+        out["emb_cos"] = np.full(len(merged), -1.0, dtype=np.float32)
+        out["emb_retrieved"] = np.zeros(len(merged), dtype=np.float32)
+    out["emb_agrees_with_block"] = (
+        (out["emb_retrieved"] > 0) & (merged["pass_id"].to_numpy() > 0)
+    ).astype(np.float32)
     return out
+
+
+EXTRA_FEATURES = [
+    "roman_exact", "roman_jaccard", "name_common_prefix", "roman_common_prefix",
+    "addr_house_digits",
+]
+
+
+def feature_columns():
+    return list(FEATURE_ORDER)
 
 
 def compute_features(pairs, s1, cand, cfg, chunk_size=3_000_000):
@@ -198,30 +275,40 @@ def _pairs_has_label(path) -> bool:
     return "label" in pq.ParquetFile(path).schema_arrow.names
 
 
-def _phase1_merged(cfg, split, n_parts=16, meta_split=None):
-    meta_split = meta_split or split
+def _pairs_columns(path) -> set:
+    return set(pq.ParquetFile(path).schema_arrow.names)
+
+
+_MERGE_SQL = """
+SELECT
+    p.s1_id, p.cand_id, p.is_s2, p.pass_id, p.block_score, {emb_sel} {label_sel}
+    s.name_norm, s.name_fold, s.name_roman, s.name_tokens, s.name_script,
+    s.addr_norm, s.addr_raw_missing, s.house_no, s.street_tokens, s.postal,
+    s.state_key, s.landmark_flag, coalesce(s.country, '') AS country,
+    c.name_norm AS name_norm_2, c.name_fold AS name_fold_2, c.name_roman AS name_roman_2,
+    c.name_tokens AS name_tokens_2, c.name_script AS name_script_2,
+    c.addr_norm AS addr_norm_2, c.house_no AS house_no_2,
+    c.street_tokens AS street_tokens_2, c.postal AS postal_2, c.state_key AS state_key_2,
+    coalesce(c.country, '') AS country_2,
+    sd.n AS s1_degree, cd.n AS cand_degree,
+    hash(p.s1_id) % {n_parts} AS __part
+FROM pairs p
+LEFT JOIN s1 s ON s.entity_id = p.s1_id
+LEFT JOIN cand c ON c.entity_id = p.cand_id
+LEFT JOIN sdeg sd ON sd.s1_id = p.s1_id
+LEFT JOIN cdeg cd ON cd.cand_id = p.cand_id
+"""
+
+
+def _register_meta(con, cfg, meta_split):
     data = Path(cfg.data_dir)
-    pairs_path = data / "pairs" / f"{split}_pairs.parquet"
     s1_path = data / "processed" / f"{meta_split}_source1.parquet"
     cand_paths = [data / "processed" / f"{meta_split}_source{source}.parquet" for source in (2, 3)]
-    out_dir = data / "tmp" / f"{split}_merged"
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     country_files = [
         Path(cfg.dataset_dir) / meta_split / f"{meta_split}_source{source}.tsv"
         for source in (1, 2, 3)
     ]
     country_files = [f.as_posix() for f in country_files if f.exists()]
-
-    con = duckdb.connect()
-    con.execute("SET memory_limit='12GB'")
-    con.execute("SET threads=8")
-    con.execute("SET preserve_insertion_order=false")
-    con.execute(f"SET temp_directory='{(data / 'tmp').as_posix()}'")
-    con.execute("PRAGMA max_temp_directory_size='80GiB'")
-
     if country_files:
         files_sql = "[" + ",".join(f"'{f}'" for f in country_files) + "]"
         con.execute(
@@ -233,8 +320,6 @@ def _phase1_merged(cfg, split, n_parts=16, meta_split=None):
             "CREATE TEMP TABLE country AS SELECT CAST(NULL AS VARCHAR) AS entity_id, "
             "CAST(NULL AS VARCHAR) AS country WHERE false"
         )
-
-    con.execute(f"CREATE TEMP TABLE pairs AS SELECT * FROM read_parquet('{pairs_path.as_posix()}')")
     con.execute(
         "CREATE TEMP TABLE s1 AS SELECT x.*, coalesce(c.country, '') AS country "
         f"FROM read_parquet('{s1_path.as_posix()}') x LEFT JOIN country c ON c.entity_id = x.entity_id"
@@ -244,29 +329,26 @@ def _phase1_merged(cfg, split, n_parts=16, meta_split=None):
         "CREATE TEMP TABLE cand AS SELECT x.*, coalesce(c.country, '') AS country "
         f"FROM read_parquet({cand_sql}) x LEFT JOIN country c ON c.entity_id = x.entity_id"
     )
+
+
+def _phase1_merged(cfg, split, n_parts=16, meta_split=None):
+    """Materialise one merged parquet per hash bucket (all buckets kept on disk)."""
+    meta_split = meta_split or split
+    data = Path(cfg.data_dir)
+    pairs_path = data / "pairs" / f"{split}_pairs.parquet"
+    out_dir = data / "tmp" / f"{split}_merged"
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    con = connect(cfg)
+    con.execute(f"CREATE TEMP TABLE pairs AS SELECT * FROM read_parquet('{pairs_path.as_posix()}')")
+    _register_meta(con, cfg, meta_split)
     con.execute("CREATE TEMP TABLE sdeg AS SELECT s1_id, count(*) AS n FROM pairs GROUP BY s1_id")
     con.execute("CREATE TEMP TABLE cdeg AS SELECT cand_id, count(*) AS n FROM pairs GROUP BY cand_id")
-
     label_sel = "p.label," if _pairs_has_label(pairs_path) else ""
-    sql = f"""
-    SELECT
-        p.s1_id, p.cand_id, p.is_s2, p.pass_id, p.block_score, {label_sel}
-        s.name_norm, s.name_fold, s.name_roman, s.name_tokens, s.name_script,
-        s.addr_norm, s.addr_raw_missing, s.house_no, s.street_tokens, s.postal,
-        s.state_key, s.landmark_flag, coalesce(s.country, '') AS country,
-        c.name_norm AS name_norm_2, c.name_fold AS name_fold_2, c.name_roman AS name_roman_2,
-        c.name_tokens AS name_tokens_2, c.name_script AS name_script_2,
-        c.addr_norm AS addr_norm_2, c.house_no AS house_no_2,
-        c.street_tokens AS street_tokens_2, c.postal AS postal_2, c.state_key AS state_key_2,
-        coalesce(c.country, '') AS country_2,
-        sd.n AS s1_degree, cd.n AS cand_degree,
-        hash(p.s1_id) % {int(n_parts)} AS __part
-    FROM pairs p
-    LEFT JOIN s1 s ON s.entity_id = p.s1_id
-    LEFT JOIN cand c ON c.entity_id = p.cand_id
-    LEFT JOIN sdeg sd ON sd.s1_id = p.s1_id
-    LEFT JOIN cdeg cd ON cd.cand_id = p.cand_id
-    """
+    emb_sel = "p.emb_cos," if "emb_cos" in _pairs_columns(pairs_path) else ""
+    sql = _MERGE_SQL.format(label_sel=label_sel, emb_sel=emb_sel, n_parts=int(n_parts))
     tmp_out = (data / "tmp" / f"{split}_merged_copy").as_posix()
     if Path(tmp_out).exists():
         shutil.rmtree(tmp_out)
@@ -278,8 +360,11 @@ def _phase1_merged(cfg, split, n_parts=16, meta_split=None):
     if out_dir.exists():
         shutil.rmtree(out_dir)
     shutil.move(tmp_out, out_dir)
-    parts = sorted(out_dir.rglob("*.parquet"))
-    return parts
+    return sorted(out_dir.rglob("*.parquet"))
+
+
+def _bucket_expr(n_parts: int) -> str:
+    return f"hash(p.s1_id) % {int(n_parts)}"
 
 
 def _process_part(args):
@@ -317,39 +402,76 @@ def _combine_feature_parts(part_dir, out_path):
     return rows
 
 
-def run_features(cfg, split="train", workers=1, combine=False, n_parts=16, keep_merged=False, meta_split=None):
+def _stream_buckets(cfg, split, n_parts, meta_split, feat_dir):
+    """Featurise one hash bucket at a time, keeping only that bucket on disk."""
     data = Path(cfg.data_dir)
-    merged_parts = _phase1_merged(cfg, split, n_parts=n_parts, meta_split=meta_split)
-    print(f"[features] phase1 merged parts: {len(merged_parts)}", flush=True)
+    pairs_path = data / "pairs" / f"{split}_pairs.parquet"
+    tmp_bucket = data / "tmp" / f"{split}_bucket.parquet"
+    tmp_bucket.parent.mkdir(parents=True, exist_ok=True)
+    label_sel = "p.label," if _pairs_has_label(pairs_path) else ""
+    emb_sel = "p.emb_cos," if "emb_cos" in _pairs_columns(pairs_path) else ""
+    total = 0
+    for bucket in range(n_parts):
+        if tmp_bucket.exists():
+            tmp_bucket.unlink()
+        con = connect(cfg)
+        con.execute(f"CREATE TEMP TABLE pairs AS SELECT * FROM read_parquet('{pairs_path.as_posix()}')")
+        _register_meta(con, cfg, meta_split or split)
+        con.execute("CREATE TEMP TABLE sdeg AS SELECT s1_id, count(*) AS n FROM pairs GROUP BY s1_id")
+        con.execute("CREATE TEMP TABLE cdeg AS SELECT cand_id, count(*) AS n FROM pairs GROUP BY cand_id")
+        sql = (
+            _MERGE_SQL.format(label_sel=label_sel, emb_sel=emb_sel, n_parts=n_parts)
+            + f" WHERE {_bucket_expr(n_parts)} = {bucket}"
+        )
+        con.execute(f"COPY ({sql}) TO '{tmp_bucket.as_posix()}' (FORMAT PARQUET)")
+        con.close()
+        res = _process_part((str(tmp_bucket), str(feat_dir / f"part_{bucket:04d}.parquet")))
+        total += res["rows"]
+        print(f"[features] bucket {bucket + 1}/{n_parts}: {res['rows']:,} rows", flush=True)
+        tmp_bucket.unlink(missing_ok=True)
+    return total
 
+
+def run_features(cfg, split="train", workers=1, combine=False, n_parts=16, keep_merged=False,
+                 meta_split=None, strategy="block"):
+    data = Path(cfg.data_dir)
     feat_dir = data / "tmp" / f"{split}_features"
     if feat_dir.exists():
         shutil.rmtree(feat_dir)
     feat_dir.mkdir(parents=True, exist_ok=True)
-    tasks = [
-        (str(part), str(feat_dir / f"part_{i:04d}.parquet"))
-        for i, part in enumerate(merged_parts)
-    ]
 
-    if workers and workers > 1:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(_process_part, tasks))
+    if strategy == "stream":
+        total = _stream_buckets(cfg, split, n_parts, meta_split, feat_dir)
+        tasks = sorted(feat_dir.glob("*.parquet"))
+        print(f"[features] stream done: {total:,} feature rows in {len(tasks)} parts", flush=True)
     else:
-        results = [_process_part(task) for task in tasks]
-    rows = sum(r["rows"] for r in results)
-    print(f"[features] phase2 done: {rows:,} feature rows in {len(tasks)} parts", flush=True)
-
-    if not keep_merged:
-        shutil.rmtree(data / "tmp" / f"{split}_merged", ignore_errors=True)
+        merged_parts = _phase1_merged(cfg, split, n_parts=n_parts, meta_split=meta_split)
+        print(f"[features] phase1 merged parts: {len(merged_parts)}", flush=True)
+        tasks = [
+            (str(part), str(feat_dir / f"part_{i:04d}.parquet"))
+            for i, part in enumerate(merged_parts)
+        ]
+        if workers and workers > 1:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(_process_part, tasks))
+        else:
+            results = [_process_part(task) for task in tasks]
+        total = sum(r["rows"] for r in results)
+        print(f"[features] phase2 done: {total:,} feature rows in {len(tasks)} parts", flush=True)
+        if not keep_merged:
+            shutil.rmtree(data / "tmp" / f"{split}_merged", ignore_errors=True)
 
     out_path = data / "features" / f"{split}.parquet"
     if combine:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         combined = _combine_feature_parts(feat_dir, out_path)
+        shutil.rmtree(feat_dir, ignore_errors=True)
+        n_label = 3 if _pairs_has_label(data / "pairs" / f"{split}_pairs.parquet") else 2
         return {
             "rows": combined,
-            "columns": len(FEATURE_ORDER) + (3 if _pairs_has_label(data / "pairs" / f"{split}_pairs.parquet") else 2),
+            "columns": len(feature_columns()) + n_label,
             "path": str(out_path),
             "parts": len(tasks),
+            "strategy": strategy,
         }
-    return {"rows": rows, "parts": len(tasks), "parts_dir": str(feat_dir)}
+    return {"rows": total, "parts": len(tasks), "parts_dir": str(feat_dir), "strategy": strategy}

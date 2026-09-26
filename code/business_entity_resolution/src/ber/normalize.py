@@ -30,6 +30,15 @@ SUFFIX_CLASSES = {
     "sas": "sas",
     "sa": "sa",
     "gmbh": "gmbh",
+    # French forms. France is ~15% of the test split with no training labels, and
+    # these appear constantly in French business names; without them the legal-suffix
+    # strip leaves a token that blocks no match against its ASCII counterpart.
+    "sci": "sci",
+    "eurl": "eurl",
+    "selarl": "selarl",
+    "snc": "snc",
+    "scs": "scs",
+    "sca": "sca",
 }
 
 
@@ -74,9 +83,19 @@ def detect_script(s: str) -> str:
     return "mixed"
 
 
+# French legal forms are frequently written as a PREFIX ("SARL Martin", "SCI Foo")
+# rather than a suffix, so a trailing-only strip leaves the token in the name and
+# blocks no match against the ASCII form. Restricted to unambiguous multi-character
+# forms: a bare leading "sa" or "inc" is far more likely to be part of a real name.
+LEADING_SUFFIXES = {"sarl", "eurl", "selarl", "snc", "scs", "sca", "sci"}
+
+
 def strip_legal_suffix(s: str) -> tuple:
     tokens = fold_name(s).split()
     suffix = ""
+    if len(tokens) > 1 and tokens[0] in LEADING_SUFFIXES:
+        suffix = SUFFIX_CLASSES[tokens[0]]
+        tokens = tokens[1:]
     while tokens and tokens[-1] in SUFFIX_CLASSES:
         if not suffix:
             suffix = SUFFIX_CLASSES[tokens[-1]]

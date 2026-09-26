@@ -34,7 +34,10 @@ def _token_romanize(token: str) -> str:
         out = transliterate(token, scheme, sanscript.ITRANS)
     except Exception:
         return ""
-    return " ".join("".join(ch if ord(ch) < 128 else " " for ch in out).split())
+    # ITRANS encodes long vowels with capitals ("sharmA"); casefold so a romanized
+    # Indic token is comparable with the ASCII Source 1 token it should match.
+    out = "".join(ch if ord(ch) < 128 else " " for ch in out).casefold()
+    return " ".join(out.split())
 
 
 @functools.lru_cache(maxsize=200_000)

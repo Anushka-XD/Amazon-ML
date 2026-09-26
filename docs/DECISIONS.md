@@ -100,4 +100,46 @@ Each entry: decision, context, alternatives, and consequence.
 - **Context:** F0.5 is precision-heavy and per-entity; US and India have different score distributions, and true singletons are worth 1.0 only if predicted empty.
 - **Decision:** tune thresholds per country (US/India) with a global fallback for unseen France, and add a singleton decision (`max prob < tau` → empty).
 - **Consequence:** targets the India cell (0.788) and false merges on singletons; guarded by LOO to avoid overfitting the unlabeled France slice.
+- **Superseded in part by D17:** per-country tuning is unsafe for an open-set country, so
+  calibration is done on a name-similarity proxy rather than the `country` column.
+
+## D16 — Address keys must select the *rarest* street token, not the first
+- **Context:** `block_keys` built pass 4 from `house_no|street_tokens[0][:5]`. In French addresses
+  the type word is followed by grammatical particles, so `Rue de la Paix` reduced to key `de`,
+  `Boulevard du President` to `du`, `Avenue des Champs` to `des` — tokens shared by a large share
+  of addresses, whose blocks are therefore always over the per-pass cap and always dropped.
+- **Decision:** `street_key_component` picks the rarest street token by IDF, with a particle
+  stopword list. Language-agnostic, so it lifts France and India together rather than
+  special-casing French.
+- **Consequence:** verified on 5 French addresses; not yet verified on the real French slice.
+
+## D17 — Calibrate on a name-similarity proxy, never on the `country` column
+- **Context:** France is 14.98% of test with zero labels, and `RULES.md` §1.5 forbids conditioning
+  on country. Per-country thresholds fitted on US/India would extrapolate badly to an unseen
+  country.
+- **Decision:** one global (threshold, margin, singleton-tau) rule, tuned on the full candidate
+  set. Any per-slice analysis is reported as a diagnostic, never as a fitted parameter.
+- **Consequence:** France inherits the global optimum instead of a guess, which is the best
+  available outcome for a zero-shot country.
+
+## D18 — Dense retrieval as a second, independent candidate source
+- **Context:** key-based blocking saturates at 0.884 pair recall. Measured on real missed pairs,
+  the residual is a *similarity-measure* gap, not absent signal: 100% of missed truth pairs clear
+  cosine 0.85 under `intfloat/multilingual-e5-small`, mean 0.965, against 0.822 for unrelated
+  pairs. Romanization, the obvious alternative, recovers almost nothing (9.9% shared tokens).
+- **Decision:** add embedding top-K retrieval as a second candidate source and **union** it with
+  the key-based set, preserving provenance rather than merging it.
+- **Rationale for unioning, not replacing:** the two sources fail differently, and their
+  *agreement* is a strong precision signal — which matters because F0.5 weights precision double.
+  `emb_agrees_with_block` is carried as an explicit feature.
+- **Consequence:** `emb_cos` / `emb_retrieved` / `emb_agrees_with_block` added to `FEATURE_ORDER`;
+  `ber/union_candidates.py` records whether each pair came from keys, retrieval, or both.
+
+## D19 — Candidate selection ranks by block score first, agreement second
+- **Context:** ordering by `n_passes DESC` (how many passes proposed a pair) let a fuzzy
+  multi-pass pair outrank an exact-name match, which was then pushed outside the per-S1 cap.
+  Missed pairs were found with *identical* names scoring cosine 1.000.
+- **Decision:** `ORDER BY block_score DESC, n_passes DESC, cand_id`, so an exact-name match
+  (block_score 1.0) can never be crowded out.
+- **Consequence:** fixes a self-inflicted recall loss; exact-name matches are now guaranteed a slot.
 
