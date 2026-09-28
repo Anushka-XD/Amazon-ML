@@ -1,9 +1,6 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
 **Team Name:** AA..><  
-**Team Members:** [List all team members]  
-**Submission Date:** [Date]
-
 ---
 
 ## 1. Executive Summary
