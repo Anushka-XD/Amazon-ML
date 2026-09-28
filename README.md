@@ -1,5 +1,5 @@
 # Amazon ML Challenge 2026 Business Entity Resolution
-MatchPoint
+# MatchPoint
 
 Scalable entity resolution pipeline matching noisy business records from **Source 2** and **Source 3** to deduplicated reference **Source 1**. Evaluated by **macro F_0.5** (precision-weighted, computed per Source 1 entity, singletons included).
 
